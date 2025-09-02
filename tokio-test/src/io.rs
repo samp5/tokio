@@ -45,6 +45,7 @@ pub struct Mock {
 #[derive(Debug)]
 pub struct Handle {
     tx: mpsc::UnboundedSender<Action>,
+    shutdown: bool,
 }
 
 /// Builds `Mock` instances.
@@ -53,6 +54,8 @@ pub struct Builder {
     // Sequence of actions for the Mock to take
     actions: VecDeque<Action>,
     name: String,
+    // Certain operations should not be allowed after a shutdown or shutdown error
+    shutdown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,10 +63,12 @@ enum Action {
     Read(Vec<u8>),
     Write(Vec<u8>),
     Wait(Duration),
+    Shutdown,
     // Wrapped in Arc so that Builder can be cloned and Send.
     // Mock is not cloned as does not need to check Rc for ref counts.
     ReadError(Option<Arc<io::Error>>),
     WriteError(Option<Arc<io::Error>>),
+    ShutdownError(Option<Arc<io::Error>>),
 }
 
 struct Inner {
@@ -71,6 +76,7 @@ struct Inner {
     waiting: Option<Instant>,
     sleep: Option<Pin<Box<Sleep>>>,
     read_wait: Option<Waker>,
+    eof: bool,
     rx: UnboundedReceiverStream<Action>,
     name: String,
 }
@@ -105,6 +111,9 @@ impl Builder {
     /// The next operation in the mock's script will be to expect a `write`
     /// call.
     pub fn write(&mut self, buf: &[u8]) -> &mut Self {
+        if self.shutdown {
+            panic!("write after shutdown")
+        }
         self.actions.push_back(Action::Write(buf.into()));
         self
     }
@@ -116,6 +125,26 @@ impl Builder {
     pub fn write_error(&mut self, error: io::Error) -> &mut Self {
         let error = Some(error.into());
         self.actions.push_back(Action::WriteError(error));
+        self
+    }
+
+    /// Sequence a `shutdown` operation.
+    ///
+    /// The next operation in the mock's script will be to expect a `shutdown`
+    /// call.
+    pub fn shutdown(&mut self) -> &mut Self {
+        self.shutdown = true;
+        self.actions.push_back(Action::Shutdown);
+        self
+    }
+
+    /// Sequence a `shutdown` operation that produces an error.
+    ///
+    /// The next operation in the mock's script will be to expect a `shutdown`
+    /// call that provides `error`.
+    pub fn shutdown_error(&mut self, error: io::Error) -> &mut Self {
+        let error = Some(error.into());
+        self.actions.push_back(Action::ShutdownError(error));
         self
     }
 
@@ -143,7 +172,7 @@ impl Builder {
 
     /// Build a `Mock` value paired with a handle
     pub fn build_with_handle(&mut self) -> (Mock, Handle) {
-        let (inner, handle) = Inner::new(self.actions.clone(), self.name.clone());
+        let (inner, handle) = Inner::new(self.actions.clone(), self.name.clone(), self.shutdown);
 
         let mock = Mock { inner };
 
@@ -176,6 +205,9 @@ impl Handle {
     /// The next operation in the mock's script will be to expect a `write`
     /// call.
     pub fn write(&mut self, buf: &[u8]) -> &mut Self {
+        if self.shutdown {
+            panic!("write after shutdown")
+        }
         self.tx.send(Action::Write(buf.into())).unwrap();
         self
     }
@@ -189,10 +221,29 @@ impl Handle {
         self.tx.send(Action::WriteError(error)).unwrap();
         self
     }
+
+    /// Sequence a `shutdown` operation.
+    ///
+    /// The next operation in the mock's script will be to expect a `shutdown`
+    /// call.
+    pub fn shutdown(&mut self) -> &mut Self {
+        self.shutdown = true;
+        self.tx.send(Action::Shutdown).unwrap();
+        self
+    }
+
+    /// Sequence a `shutdown` operation error.
+    ///
+    /// The next operation in the mock's script will be to expect a `shutdown` error.
+    pub fn shutdown_error(&mut self, error: io::Error) -> &mut Self {
+        let error = Some(error.into());
+        self.tx.send(Action::ShutdownError(error)).unwrap();
+        self
+    }
 }
 
 impl Inner {
-    fn new(actions: VecDeque<Action>, name: String) -> (Inner, Handle) {
+    fn new(actions: VecDeque<Action>, name: String, shutdown: bool) -> (Inner, Handle) {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let rx = UnboundedReceiverStream::new(rx);
@@ -201,12 +252,13 @@ impl Inner {
             actions,
             sleep: None,
             read_wait: None,
+            eof: false,
             rx,
             waiting: None,
             name,
         };
 
-        let handle = Handle { tx };
+        let handle = Handle { tx, shutdown };
 
         (inner, handle)
     }
@@ -227,6 +279,12 @@ impl Inner {
                 // Drain the data from the source
                 data.drain(..n);
 
+                Ok(())
+            }
+            Some(&mut Action::Shutdown) => {
+                // Treat shutdown as EOF, pop action in case of cancellation
+                self.eof = true;
+                self.actions.pop_front();
                 Ok(())
             }
             Some(&mut Action::ReadError(ref mut err)) => {
@@ -327,7 +385,12 @@ impl Inner {
                         break;
                     }
                 }
-                Action::ReadError(ref mut error) | Action::WriteError(ref mut error) => {
+                Action::Shutdown => {
+                    break;
+                }
+                Action::ReadError(ref mut error)
+                | Action::WriteError(ref mut error)
+                | Action::ShutdownError(ref mut error) => {
                     if error.is_some() {
                         break;
                     }
@@ -470,8 +533,61 @@ impl AsyncWrite for Mock {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(ref mut sleep) = self.inner.sleep {
+                ready!(Pin::new(sleep).poll(cx));
+            }
+
+            self.inner.sleep = None;
+
+            // read saw EOF and popped our action
+            if self.inner.eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            match self.inner.action() {
+                Some(&mut Action::Shutdown) => {
+                    // Consume the shutdown action, but do not mark EOF, as reads are still allowed
+                    // after shutdown
+                    self.inner.actions.pop_front();
+
+                    return Poll::Ready(Ok(()));
+                }
+                Some(&mut Action::ShutdownError(ref mut err)) => {
+                    let err = err.take().expect("Should have been removed from actions.");
+                    let err = Arc::try_unwrap(err).expect("There are no other references.");
+
+                    // Consume the shutdown_error action
+                    self.inner.actions.pop_front();
+
+                    return Poll::Ready(Err(err));
+                }
+                Some(&mut Action::Wait(_)) => {
+                    if let Some(rem) = self.inner.remaining_wait() {
+                        let until = Instant::now() + rem;
+
+                        // Timer to wake on
+                        self.inner.sleep = Some(Box::pin(time::sleep_until(until)));
+                        continue;
+                    }
+                }
+                Some(_) => {
+                    // Some other action is expected
+                    panic!("unexpected shutdown {}", self.pmsg());
+                }
+                // Try and fetch actions from Handle
+                None => match ready!(self.inner.poll_action(cx)) {
+                    Some(action) => {
+                        self.inner.actions.push_back(action);
+                        continue;
+                    }
+                    None => {
+                        panic!("unexpected shutdown {}", self.pmsg());
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -494,6 +610,7 @@ impl Drop for Mock {
                 "There is still data left to write. {}",
                 self.pmsg()
             ),
+            Action::Shutdown => panic!("Expected Mock to be shutdown"),
             _ => (),
         });
     }
