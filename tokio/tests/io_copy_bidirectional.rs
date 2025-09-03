@@ -153,11 +153,13 @@ async fn copy_bidirectional_is_cooperative() {
                 let mut a = tokio_test::io::Builder::new()
                     .read(payload)
                     .write(payload)
+                    .shutdown()
                     .build();
 
                 let mut b = tokio_test::io::Builder::new()
                     .read(payload)
                     .write(payload)
+                    .shutdown()
                     .build();
 
                 let _ = copy_bidirectional(&mut a, &mut b).await;
